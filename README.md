@@ -1,3 +1,8 @@
+# About
+
+This fork objective is to run nanoGPT on AWS Sagemaker Hyperpod. 
+Current script targets a budget configuration, enough to run multi-gpu multi-node training (2x G5.12xlarge worker nodes).
+
 
 # nanoGPT
 
