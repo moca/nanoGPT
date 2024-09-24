@@ -8,7 +8,7 @@ $ python train.py --batch_size=32 --compile=False
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train.py
 
-To run with DDP on 4 gpus across 2 nodes, example:
+To run with DDP on 16 gpus across 2 nodes, example:
 - Run on the first (master) node with example IP 123.456.123.456:
 $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=0 --master_addr=123.456.123.456 --master_port=1234 train.py
 - Run on the worker node:
@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -37,7 +38,7 @@ eval_interval = 2000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -93,16 +94,18 @@ if ddp:
     # down the desired gradient accumulation iterations per process proportionally
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
+    print(f"[Init] - gradient accumulation will be {gradient_accumulation_steps}")
 else:
     # if not ddp, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
     ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+print(f"[Init] - tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
+
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -141,14 +144,14 @@ if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
     meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print(f"[Init] - found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
-    print("Initializing a new model from scratch")
+    print("[Init] - Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
@@ -193,7 +196,7 @@ if block_size < model.config.block_size:
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
+scaler = torch.amp.GradScaler(device, enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -244,6 +247,7 @@ def get_lr(it):
 # logging
 if wandb_log and master_process:
     import wandb
+    print("This is the config for WnB:", config)
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
@@ -262,7 +266,8 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[EVAL] ({now}) - step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -282,8 +287,9 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
+                print(f"[LOG] saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                print(f"[LOG] Checkpoint saved {out_dir}")
     if iter_num == 0 and eval_only:
         break
 
@@ -324,7 +330,9 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[LOG] ({now}) - iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+
     iter_num += 1
     local_iter_num += 1
 
@@ -333,4 +341,5 @@ while True:
         break
 
 if ddp:
+    torch.distributed.barrier()  ## This is important to make all workers wait leader node in the last loop.
     destroy_process_group()

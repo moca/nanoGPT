@@ -1,0 +1,21 @@
+name: nanogpt
+channels:
+  - https://aws-ml-conda.s3.us-west-2.amazonaws.com
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - pytorch
+  - pytorch-cuda=12.4   # Latest CUDA version
+  - aws-ofi-nccl=1.9.1  # latest available in  #https://aws-ml-conda.s3.us-west-2.amazonaws.com 
+  - torchvision
+  - torchaudio
+  - transformers
+  - datasets
+  - ipython
+  - pip
+  # - fsspec=2023.9.2 # to use S3 as FS
+  - pip:
+    - prettytable
+    - tiktoken
+    - wandb
